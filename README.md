@@ -31,129 +31,255 @@ pip3 install pyrealsense2
 pip install opencv-python numpy pyrealsense2
 ```
 
-## 💻 Verwendung
+## � Quick Start
 
-### Einfache Eingangserkennung
+### Installation
 ```bash
-python entrance_detection.py
+# Python-Abhängigkeiten
+pip install opencv-python numpy pyrealsense2
+
+# Optional: LiDAR-Support
+pip install rplidar-roboticia matplotlib
 ```
 
-### Erweiterte Erkennung mit 3D-Berechnung
+### Hauptsystem starten
 ```bash
-python advanced_entrance_detection.py
+python adaptive_height_control.py
 ```
 
 **Steuerung:**
 - `q` - Beenden
-- `s` - Screenshot speichern
+- `s` - Screenshot
+- `e` - Emergency Stop (Toggle)
 
-## 🔧 Wie funktioniert die Eingangserkennung?
+## � MVP-Anforderungen (Meilensteine)
 
-### 1. Tiefenanalyse
-Die Kamera misst die Entfernung zu Objekten. Eingänge/Türen haben charakteristische Eigenschaften:
-- **Große Tiefenwerte** oder **fehlende Messwerte** (freier Raum)
-- **Tiefensprünge** an den Rändern (Türrahmen)
+### ✅ Phase 1: Setup (Abgeschlossen)
+- [x] Hardware-Integration (RealSense)
+- [x] Basis-Tiefenerkennung
+- [x] Visualisierung
 
-### 2. Kantenerkennung
-Vertikale Kanten werden erkannt:
-- Infrarot-Bild für besseren Kontrast
-- Canny-Kantendetektor
-- Hough-Transform für Linienerkennung
-- Filterung nach vertikalen Linien (Türrahmen)
+### 🔄 Phase 2: Schnittstellen (MS2 - Aktuell)
+- [x] LiDAR-Daten auslesen
+- [x] Stereo-Depth-Verarbeitung
+- [ ] **Unitree SDK Integration** 🎯
+  - [ ] `SetBodyHeight()` implementieren
+  - [ ] `SetPostureMode()` implementieren
+  - [ ] Bewegungs-Feedback auslesen
 
-### 3. Kandidatenvalidierung
-Jeder Kandidat wird geprüft:
-- ✓ Breite: 0,7 - 2,5 Meter
-- ✓ Höhe: mindestens 1,8 Meter (befahrbar)
-- ✓ Aspect Ratio: höher als breit
-- ✓ Entfernung: < 5 Meter
+### 📋 Phase 3: Logik (MS3 - Next)
+- [x] Durchgangs-Geometrie-Extraktion
+- [x] Höhenberechnung mit Sicherheit
+- [x] State Machine (4 Modi)
+- [ ] **SDK-Ansteuerung verbinden**
+- [ ] Bewegungsablauf implementieren
+- [ ] Safety-Override testen
 
-### 4. 3D-Projektion
-Pixel-Koordinaten werden in 3D-Weltkoordinaten umgerechnet:
+### 🎯 Phase 4: Integration & Test
+- [ ] End-to-End Tests
+- [ ] Performance-Optimierung
+- [ ] Feldtests in echter Umgebung
+- [ ] Dokumentation finalisieren
+
+## 🧮 Technische Details
+
+### Haltungs-Modi
+
+| Modus | Höhe | Verwendung |
+|-------|------|------------|
+| **NORMAL** | 30cm | Freie Fahrt, keine Hindernisse |
+| **NIEDRIG** | 15cm | Durchgänge 15-25cm Höhe |
+| **LIEGEND** | 8cm | Durchgänge 10-15cm Höhe |
+| **BLOCKIERT** | - | < 10cm, zu eng, Stopp |
+
+### Sicherheitsparameter
+- **Sicherheitsabstand**: 5-10cm über Durchgangshöhe
+- **Annäherung**: Stopp bei 0,5m vor Durchgang
+- **Geschwindigkeit**: 0,1 m/s beim Durchqueren
+- **Max. Neigung**: 30° (schräge Decken)
+
+### Sensor-Reichweiten
+- **Tiefenkamera**: 0,3m - 3,0m (optimal: 0,5m - 2,0m)
+- **LiDAR**: 0,1m - 12m
+- **Min. Durchgangsbreite**: 35cm (Roboter + Sicherheit)
+- **Min. Durchgangshöhe**: 10cm (absolute Grenze)
+
+## 🔧 Code-Struktur
+
+### Hauptklasse: `AdaptiveHeightController`
+
 ```python
-point_3d = rs.rs2_deproject_pixel_to_point(intrinsics, [x, y], depth)
+# Initialisierung
+controller = AdaptiveHeightController(use_lidar=False)
+
+# Hauptschleife
+controller.run()
+
+# Interner Ablauf pro Frame:
+# 1. detect_ceiling_obstacle()     # INPUT
+# 2. calculate_passage_geometry()  # PROCESSING  
+# 3. decide_posture()              # DECISION
+# 4. actuate_height_change()       # OUTPUT
 ```
 
-## 🤖 LiDAR-Integration
+### Datenstrukturen
 
-Der LiDAR kann zusätzliche Informationen liefern:
-
-### Vorteile der Kombination:
-- **LiDAR**: 360° 2D-Scan auf Bodenhöhe, präzise Distanzen
-- **Tiefenkamera**: 3D-Information, Höhenerkennung, visuelle Details
-
-### Verwendung:
 ```python
-detector = MultiSensorEntranceDetector(use_lidar=True)
+@dataclass
+class PassageGeometry:
+    height: float          # Durchgangshöhe in Metern
+    width: float           # Breite in Metern
+    distance: float        # Entfernung zum Durchgang
+    tilt_angle: float      # Neigung in Grad
+    confidence: float      # Erkennungsqualität 0-1
 
-# LiDAR-Daten integrieren
-lidar_scan = [...]  # Array von (angle, distance)
-detector.integrate_lidar_data(lidar_scan)
+@dataclass  
+class RobotState:
+    current_height: float       # Aktuelle Körperhöhe
+    current_mode: PostureMode   # NORMAL/LOW/PRONE/BLOCKED
+    is_adjusting: bool          # Gerade am Anpassen?
+    emergency_stop: bool        # Notaus aktiv?
 ```
 
-### Beispiel LiDAR-Interface:
-```python
-# Für RPLidar
-from rplidar import RPLidar
+## 🎓 Algorithmen im Detail
 
-lidar = RPLidar('/dev/ttyUSB0')
-for scan in lidar.iter_scans():
-    detector.integrate_lidar_data(scan)
+### 1. Deckenerkennung
+```python
+# Obere Bildhälfte analysieren
+ceiling_roi = depth_image[10%:60%, :]
+
+# Nahe Hindernisse finden (< 3m)
+close_obstacles = ceiling_distances < 3.0
+
+# Kontur-Extraktion → Bounding Box
 ```
 
-## 📊 Parameter anpassen
-
-In `advanced_entrance_detection.py`:
+### 2. Höhenberechnung
 ```python
-self.min_entrance_width = 0.7      # Minimale Breite (Meter)
-self.max_entrance_width = 2.5      # Maximale Breite
-self.min_entrance_height = 1.8     # Mindesthöhe für Befahrbarkeit
-self.max_detection_range = 5.0     # Maximale Erkennungsdistanz
+# 3D-Projektion der Unterkante
+bottom_3d = rs2_deproject_pixel_to_point([x, y], depth)
+
+# Höhe = Abstand Boden → Hindernis
+passage_height = abs(bottom_3d[1] - ground_3d[1])
+
+# Mit Sicherheit
+target_height = passage_height - safety_clearance
 ```
 
-## 🎓 Algorithmus im Detail
+### 3. State Machine
+```python
+if target_height >= 0.25:
+    return NORMAL, 0.30
+elif target_height >= 0.15:
+    return LOW, target_height  # Ducken
+elif target_height >= 0.10:
+    return PRONE, 0.08         # Hinlegen
+else:
+    return BLOCKED, current    # Zu eng
+```
 
-1. **Frame-Erfassung**: Depth + Color + IR Streams synchronized
-2. **Filterung**: Spatial, Temporal, Hole-Filling Filter
-3. **Tiefensprung-Detektion**: Sobel-Filter für Gradienten
-4. **Strukturerkennung**: Vertikale Linien im IR-Bild
-5. **Kandidatenfindung**: Linienpaare analysieren
-6. **Dimensionsberechnung**: 3D-Projektion
-7. **Validierung**: Konfidenz-Score berechnen
-8. **Ausgabe**: Visualisierung + 3D-Koordinaten
+## 🔌 Unitree SDK Integration (TODO)
 
-## 🐛 Troubleshooting
+### Benötigte Funktionen
+```python
+# In adaptive_height_control.py, Methode: actuate_height_change()
 
-### Kamera nicht gefunden
+# TODO: Ersetze Stub durch echte SDK-Calls:
+
+from unitree_sdk import RobotInterface  # Beispiel
+
+robot = RobotInterface()
+
+# Höhe setzen
+robot.SetBodyHeight(target_height)  # in Metern
+
+# Haltung wechseln
+robot.SetPostureMode(mode)  # "stand", "crouch", "prone"
+
+# Status abfragen
+current_height = robot.GetBodyHeight()
+is_stable = robot.IsStable()
+
+# Notaus
+robot.EmergencyStop()
+```
+
+### Integration Steps
+1. Unitree SDK installieren/importieren
+2. `actuate_height_change()` anpassen
+3. Bewegungs-Feedback implementieren
+4. Safety-Checks mit IMU verbinden
+5. Testen mit echtem Roboter
+
+## 🧪 Testing
+
+### Simulation
 ```bash
-# USB-Verbindung prüfen
-rs-enumerate-devices
-
-# Rechte setzen (Linux)
-sudo usermod -a -G plugdev $USER
+# Teste ohne Hardware (mit Recording)
+python adaptive_height_control.py
+# Halte Objekte vor Kamera in verschiedenen Höhen
 ```
 
-### Schlechte Erkennung
-- Beleuchtung verbessern
-- Kamera-Parameter anpassen (Exposure)
-- Filter-Schwellwerte tunen
-- Mindestabstand einhalten (> 0,5m)
+### Mit Roboter
+1. Roboter in sicherer Umgebung platzieren
+2. Niedrige Hindernisse (20cm, 15cm, 10cm) vorbereiten
+3. System starten
+4. Langsam Hindernisse annähern
+5. Beobachte Höhenanpassung
 
-### Performance-Probleme
-- Auflösung reduzieren (320x240)
-- FPS reduzieren (15 statt 30)
-- Nur Depth-Stream nutzen
+### Testfälle
+- [ ] Normaler Durchgang (>25cm) → Keine Anpassung
+- [ ] Niedriger Durchgang (20cm) → Ducken
+- [ ] Sehr niedriger Durchgang (12cm) → Hinlegen
+- [ ] Zu enger Durchgang (8cm) → Blockiert
+- [ ] Schräge Decke (15° Neigung) → Anpassung
+- [ ] Emergency Stop → Sofortiger Halt
 
-## 📚 Ressourcen
+## 📚 Weitere Ressourcen
 
+## 📚 Weitere Ressourcen
+
+- **PROJECT_SPEC.md** - Vollständige technische Spezifikation
 - [Intel RealSense Documentation](https://dev.intelrealsense.com/)
+- [Unitree Robotics](https://www.unitree.com/)
 - [OpenCV Tutorials](https://docs.opencv.org/)
-- [RealSense Python Examples](https://github.com/IntelRealSense/librealsense/tree/master/wrappers/python/examples)
 
-## 🎯 Nächste Schritte
+## 👥 Projekt-Info
 
-1. **Echte LiDAR-Integration** implementieren
-2. **SLAM** für Kartierung hinzufügen
-3. **Navigation** basierend auf erkannten Eingängen
-4. **Machine Learning** für robustere Erkennung
-5. **ROS-Integration** für Roboter-Plattformen
+**Repository**: github.com/eliasbuergin/Bewegungserweiterung  
+**Entwickler**: Elias Bürgin  
+**Projekt**: MPEC - Motion Path Extension and Control  
+**Zweck**: Autonome Höhlenerkundung mit Unitree GO2
+
+---
+
+## 📝 Nächste Schritte für Entwicklung
+
+### Priorität 1: SDK-Integration (MS2)
+```bash
+# TODO:
+1. Unitree SDK installieren
+2. actuate_height_change() mit echten Calls ersetzen
+3. Feedback-Loop implementieren (GetBodyHeight)
+4. Safety-Checks mit IMU verbinden
+```
+
+### Priorität 2: Bewegungsablauf (MS3)
+```bash
+# TODO:
+1. Annäherungs-Sequenz (langsam bis 0.5m)
+2. Höhenanpassung (2-3 Sekunden warten)
+3. Durchquerung (0.1 m/s, Kollisionserkennung)
+4. Zurück zu Normal (nach Durchgang)
+```
+
+### Priorität 3: Robustheit
+```bash
+# TODO:
+1. Mehrfach-Messungen für Stabilität
+2. Kalman-Filter für Höhenschätzung
+3. Fehlerbehandlung (Sensorfehler, Timeouts)
+4. Logging & Telemetrie
+```
+
+**Status**: MVP in Entwicklung | Version 0.3.0 | Stand: 1. Dezember 2025
